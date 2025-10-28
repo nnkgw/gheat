@@ -1,15 +1,17 @@
 // gheat.cpp
-// Heat Method (Geodesics in Heat) viewer with glm-based camera & vertex picking.
+// Heat Method (Geodesics in Heat) viewer with glm-based camera, vertex picking,
+// red->yellow->white heat colormap, and white geodesic contour lines.
 // Compute: Eigen (sparse). Rendering & camera: OpenGL + GLUT/freeglut + glm.
+//
 // Mouse:
-//   - Left-drag : rotate (yaw/pitch)
-//   - Right-drag: pan
-//   - Left-click (no drag): pick nearest projected vertex -> recompute distances
-//   - Mouse wheel: zoom (ONLY when FREEGLUT is defined)
+//   Left-drag  : rotate (yaw/pitch)
+//   Right-drag : pan
+//   Left-click : pick nearest vertex (no-drag) -> recompute distances
+//   Wheel      : zoom (ONLY when FREEGLUT is defined)
 // Keys:
-//   - r : randomize source vertex
-//   - +/- : zoom in/out
-//   - q or ESC : quit
+//   r          : randomize source vertex
+//   +/-        : zoom in/out
+//   q / ESC    : quit
 
 #if defined(WIN32)
   #pragma warning(disable:4996)
@@ -31,7 +33,7 @@
 #include <Eigen/Core>
 #include <Eigen/SparseCore>
 #include <Eigen/SparseCholesky>
-#include <Eigen/Geometry> // Vector3d::cross, normalized
+#include <Eigen/Geometry>
 
 #include <cstdio>
 #include <cstdlib>
@@ -43,6 +45,7 @@
 #include <sstream>
 #include <random>
 #include <algorithm>
+#include <limits>
 
 // ---------------- Types ----------------
 using Vec3 = Eigen::Vector3d;
@@ -83,11 +86,11 @@ static bool moved = false;
 static const int PICK_RADIUS_PX = 12;   // max pixel distance for picking
 static const int CLICK_MOVE_TOL = 3;    // pixels: within -> treated as click
 
-// keep glm matrices in sync with OpenGL fixed pipeline
+// keep glm matrices for math/picking
 static glm::mat4 gProj(1.0f);
 static glm::mat4 gMV(1.0f);
 static glm::mat4 gMVP(1.0f);
-static const float kFovY = glm::radians(45.0f);
+static const float kFovY  = glm::radians(45.0f);
 static const float kZNear = 0.001f;
 static const float kZFar  = 1000000.0f;
 
@@ -285,13 +288,13 @@ static void initCameraFromBounds() {
   sceneCenter = 0.5*(gM.bbmin + gM.bbmax);
   double diag = (gM.bbmax - gM.bbmin).norm();
   if (diag <= 1e-12) diag = 1.0;
-  camDist = diag * 1.8;
+  camDist = diag * 1.8;   // distance proportional to bbox size
   yawRad = 0.4; pitchRad = 0.2;
   panX = panY = 0.0;
 }
 
 static void setProjectionAndView() {
-  // OpenGL fixed-pipeline (for drawing)
+  // OpenGL fixed-pipeline for drawing
   glMatrixMode(GL_PROJECTION);
   glLoadIdentity();
   double aspect = (double)gWinW / (double)gWinH;
@@ -301,13 +304,12 @@ static void setProjectionAndView() {
 
   // glm matrices (for math & picking)
   gProj = glm::perspective(kFovY, (float)aspect, kZNear, kZFar);
-
   glm::mat4 R = glm::yawPitchRoll((float)yawRad, (float)pitchRad, 0.0f);
   glm::vec3 sc((float)sceneCenter.x(), (float)sceneCenter.y(), (float)sceneCenter.z());
   glm::vec3 eye = sc + glm::vec3(R * glm::vec4(0, 0, (float)camDist, 1));
   glm::mat4 V = glm::lookAt(eye, sc, glm::vec3(0,1,0));
   glm::mat4 Tpan = glm::translate(glm::mat4(1.0f), glm::vec3((float)panX, (float)panY, 0.0f));
-  gMV = V * Tpan;
+  gMV  = V * Tpan;
   gMVP = gProj * gMV;
 
   // Load MV into OpenGL
@@ -315,21 +317,32 @@ static void setProjectionAndView() {
 }
 
 // ---------------- Coloring ----------------
-static void scalarToRGB(double s, double smin, double smax, double& r, double& g, double& b) {
+// Red -> Yellow -> White heat colormap (distance small = white-ish, large = deep red)
+static void scalarToHeatColor(double s, double smin, double smax, double& r, double& g, double& b) {
   double t = (s - smin) / (smax - smin + 1e-20);
   t = clamp01(t);
-  double x = t;
-  r = clamp01(-0.7 + 3.5*x);
-  g = clamp01(0.2 +  2.0*x);
-  b = clamp01(0.9 -  1.2*x + 0.3*std::sin(6.28318*x));
+  // Piecewise: [0,0.5]: red->yellow, (0.5,1]: yellow->white
+  if (t <= 0.5) {
+    double u = t / 0.5;      // 0..1
+    r = 1.0;
+    g = 0.1 + 0.9*u;         // 0.1 -> 1.0
+    b = 0.0;
+  } else {
+    double u = (t - 0.5) / 0.5; // 0..1
+    r = 1.0;
+    g = 1.0;
+    b = 0.0 + 1.0*u;         // yellow -> white
+  }
 }
 
 // ---------------- Rendering ----------------
 static int gSource = -1;
 
-static void renderMeshColored() {
+// 1) color pass
+static void renderSurfaceColored() {
   if(gM.V.empty() || gM.F.empty() || gM.phi.empty()) return;
 
+  // Contrast boost: clamp upper to 95th percentile
   std::vector<double> tmp = gM.phi;
   std::nth_element(tmp.begin(), tmp.begin() + (int)(0.95*tmp.size()), tmp.end());
   double p95 = tmp[(int)(0.95*tmp.size())];
@@ -340,7 +353,7 @@ static void renderMeshColored() {
     for(int k=0;k<3;++k){
       int vid = f[k];
       double r,g,b;
-      scalarToRGB(gM.phi[vid], smin, smax, r,g,b);
+      scalarToHeatColor(gM.phi[vid], smin, smax, r,g,b);
       glColor3d(r,g,b);
       const Vec3& p = gM.V[vid];
       glVertex3d(p.x(), p.y(), p.z());
@@ -348,6 +361,7 @@ static void renderMeshColored() {
   }
   glEnd();
 
+  // mark source vertex
   if(gSource>=0){
     glPointSize(6.f);
     glBegin(GL_POINTS);
@@ -358,27 +372,85 @@ static void renderMeshColored() {
   }
 }
 
+// 2) contour pass (white isolines): triangle-by-triangle edge intersection
+static void renderContours() {
+  if(gM.V.empty() || gM.F.empty() || gM.phi.empty()) return;
+
+  // Choose contour spacing relative to mean edge length
+  const double step = std::max(1e-12, 0.5 * gM.meanEdge); // tune factor (0.3~1.0*meanEdge)
+  glDisable(GL_LIGHTING);
+  glLineWidth(1.25f);
+  glColor3d(1,1,1);
+
+  // Helper lambda: returns intersection point on edge (a->b) at iso value s
+  auto lerpPoint = [](const Vec3& a, const Vec3& b, double ta)->Vec3 {
+    return a + ta * (b - a);
+  };
+
+  glBegin(GL_LINES);
+  for (const auto& f : gM.F) {
+    int i=f[0], j=f[1], k=f[2];
+    const Vec3 &vi=gM.V[i], &vj=gM.V[j], &vk=gM.V[k];
+    double pi=gM.phi[i], pj=gM.phi[j], pk=gM.phi[k];
+
+    double tmin = std::min({pi,pj,pk});
+    double tmax = std::max({pi,pj,pk});
+    if (tmax - tmin < 1e-12) continue;
+
+    // integer k s.t. iso = k*step intersects [tmin, tmax]
+    int kmin = (int)std::ceil( (tmin) / step );
+    int kmax = (int)std::floor((tmax) / step);
+    for (int kk = kmin; kk <= kmax; ++kk) {
+      double iso = kk * step;
+
+      // intersect with triangle edges; collect up to 2 points
+      Vec3 P[2];
+      int cnt = 0;
+      auto edge_isect = [&](const Vec3& a, const Vec3& b, double pa, double pb){
+        double d0 = pa - iso;
+        double d1 = pb - iso;
+        if ((d0>0 && d1>0) || (d0<0 && d1<0)) return; // no crossing
+        if (std::abs(d0) < 1e-15 && std::abs(d1) < 1e-15) return; // both exactly on iso: skip (rare)
+        double denom = (pb - pa);
+        if (std::abs(denom) < 1e-15) return;
+        double t = (iso - pa) / denom;
+        if (t < 0.0 || t > 1.0) return;
+        if (cnt < 2) P[cnt++] = lerpPoint(a,b,t);
+      };
+
+      edge_isect(vi, vj, pi, pj);
+      edge_isect(vj, vk, pj, pk);
+      edge_isect(vk, vi, pk, pi);
+
+      if (cnt == 2) {
+        glVertex3d(P[0].x(), P[0].y(), P[0].z());
+        glVertex3d(P[1].x(), P[1].y(), P[1].z());
+      }
+    }
+  }
+  glEnd();
+}
+
+static void renderScene() {
+  renderSurfaceColored();
+  renderContours();
+}
+
 // ---------------- Picking ----------------
-// Screen (x,y) in window coords -> pick nearest projected vertex within radius.
 static int pickNearestVertex(int mouseX, int mouseY) {
   if(gM.V.empty()) return -1;
-  // flip Y to OpenGL window coords
   int winX = mouseX;
   int winY = gWinH - mouseY - 1;
 
   int best = -1;
   double bestD2 = (double)PICK_RADIUS_PX * (double)PICK_RADIUS_PX;
 
-  // Project each vertex via MVP (glm)
   for (int i=0;i<(int)gM.V.size();++i) {
     const Vec3& v = gM.V[i];
     glm::vec4 clip = gMVP * glm::vec4((float)v.x(), (float)v.y(), (float)v.z(), 1.0f);
     if (clip.w == 0.0f) continue;
     glm::vec3 ndc = glm::vec3(clip) / clip.w; // [-1,1]
-    // Cull if behind near/far (optional)
     if (ndc.z < -1.0f || ndc.z > 1.0f) continue;
-
-    // NDC -> window
     float sx = (ndc.x * 0.5f + 0.5f) * (float)gWinW;
     float sy = (ndc.y * 0.5f + 0.5f) * (float)gWinH;
     double dx = (double)sx - (double)winX;
@@ -397,7 +469,7 @@ static void display() {
   glEnable(GL_DEPTH_TEST);
 
   setProjectionAndView();
-  renderMeshColored();
+  renderScene();
 
   glutSwapBuffers();
 }
@@ -425,7 +497,6 @@ static void mouse(int button,int state,int x,int y){
     if (state == GLUT_DOWN) {
       lbtn = true; moved = false; downX = lastX = x; downY = lastY = y;
     } else {
-      // release: if not moved -> treat as click -> pick
       lbtn = false;
       int dx = x - downX, dy = y - downY;
       if (std::abs(dx) <= CLICK_MOVE_TOL && std::abs(dy) <= CLICK_MOVE_TOL) {
