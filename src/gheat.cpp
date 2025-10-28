@@ -390,7 +390,7 @@ static int pickNearestVertex(int mouseX, int mouseY) {
 }
 
 // ---------------- GLUT callbacks ----------------
-static void displayCB() {
+static void display() {
   glViewport(0,0,gWinW,gWinH);
   glClearColor(0.08f,0.08f,0.1f,1.f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -402,13 +402,13 @@ static void displayCB() {
   glutSwapBuffers();
 }
 
-static void reshapeCB(int w, int h) {
+static void reshape(int w, int h) {
   gWinW = (w>1)?w:1;
   gWinH = (h>1)?h:1;
   glutPostRedisplay();
 }
 
-static void keyboardCB(unsigned char key, int, int) {
+static void keyboard(unsigned char key, int, int) {
   if(key==27 || key=='q') std::exit(0);
   else if(key=='+') { camDist *= 0.9; if(camDist<1e-3) camDist=1e-3; }
   else if(key=='-') { camDist *= 1.1; }
@@ -420,7 +420,7 @@ static void keyboardCB(unsigned char key, int, int) {
   glutPostRedisplay();
 }
 
-static void mouseButtonCB(int button,int state,int x,int y){
+static void mouse(int button,int state,int x,int y){
   if (button == GLUT_LEFT_BUTTON)  {
     if (state == GLUT_DOWN) {
       lbtn = true; moved = false; downX = lastX = x; downY = lastY = y;
@@ -443,7 +443,7 @@ static void mouseButtonCB(int button,int state,int x,int y){
   }
 }
 
-static void mouseMotionCB(int x,int y){
+static void motion(int x,int y){
   int dx = x - lastX;
   int dy = y - lastY;
   lastX = x; lastY = y;
@@ -465,7 +465,7 @@ static void mouseMotionCB(int x,int y){
 }
 
 #if defined(FREEGLUT)
-static void mouseWheelCB(int wheel, int direction, int x, int y){
+static void wheel(int wheel, int direction, int x, int y){
   (void)wheel; (void)x; (void)y;
   camDist *= (direction > 0) ? 0.9 : 1.1;
   if (camDist < 1e-3) camDist = 1e-3;
@@ -496,15 +496,15 @@ int main(int argc, char** argv) {
 #endif
   glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH);
   glutInitWindowSize(gWinW, gWinH);
-  glutCreateWindow("Heat Geodesic (Eigen + glm + GLUT) - mouse & picking");
+  glutCreateWindow("Geodesics in Heat: A New Approach to Computing Distance Based on Heat Flow");
 
-  glutDisplayFunc(displayCB);
-  glutReshapeFunc(reshapeCB);
-  glutKeyboardFunc(keyboardCB);
-  glutMouseFunc(mouseButtonCB);
-  glutMotionFunc(mouseMotionCB);
+  glutDisplayFunc(display);
+  glutReshapeFunc(reshape);
+  glutKeyboardFunc(keyboard);
+  glutMouseFunc(mouse);
+  glutMotionFunc(motion);
 #if defined(FREEGLUT)
-  glutMouseWheelFunc(mouseWheelCB); // wheel only with freeglut
+  glutMouseWheelFunc(wheel); // wheel only with freeglut
 #endif
 
   glEnable(GL_POLYGON_OFFSET_FILL);
