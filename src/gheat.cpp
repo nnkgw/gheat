@@ -2,6 +2,7 @@
 // Heat Method (Geodesics in Heat) viewer with glm-based camera, vertex picking,
 // red->yellow->white heat colormap, and white geodesic contour lines.
 //
+//
 // Mouse:
 //   Left-drag  : rotate (yaw/pitch)
 //   Right-drag : pan
@@ -10,7 +11,7 @@
 // Keys:
 //   r          : randomize source vertex
 //   +/-        : zoom in/out
-//   [ / ]      : heat-time scale eta -/+
+//   [ / ]      : heat-time scale eta - / +
 //   q / ESC    : quit
 
 #if defined(WIN32)
@@ -28,7 +29,7 @@
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
-#include <glm/gtx/euler_angles.hpp> // yawPitchRoll
+#include <glm/gtx/euler_angles.hpp>
 
 #include <Eigen/Core>
 #include <Eigen/SparseCore>
@@ -71,27 +72,27 @@ static std::mt19937_64 gRng(12345);
 static Eigen::SimplicialLDLT<Sparse> gSolverHeat;
 static Eigen::SimplicialLDLT<Sparse> gSolverPoisson;
 
-// Heat 時間スケール eta（t = (eta * meanEdge)^2）
+// Heat time scale: t = (eta * meanEdge)^2
 static double gEta = 2.0;
-static const double kEpsReg = 1e-8; // Poisson 正則化
+static const double kEpsReg = 1e-8; // Poisson regularization
 
 // ---------------- Window/Camera ----------------
 static int gWinW = 1280, gWinH = 800;
-static double camDist = 3.0;     // distance from target
-static double yawRad = 0.4;      // yaw around +Y
-static double pitchRad = 0.2;    // pitch around +X
-static double panX = 0.0, panY = 0.0; // pan in view plane
+static double camDist = 3.0;
+static double yawRad = 0.4;
+static double pitchRad = 0.2;
+static double panX = 0.0, panY = 0.0;
 static Vec3 sceneCenter(0,0,0);
 
-// for picking & drag detection
+// picking
 static int lastX = -1, lastY = -1;
 static int downX = -1, downY = -1;
 static bool lbtn = false, rbtn = false;
 static bool moved = false;
-static const int PICK_RADIUS_PX = 12;   // max pixel distance for picking
-static const int CLICK_MOVE_TOL = 3;    // pixels: within -> treated as click
+static const int PICK_RADIUS_PX = 12;
+static const int CLICK_MOVE_TOL = 3;
 
-// keep glm matrices for math/picking
+// glm matrices for picking
 static glm::mat4 gProj(1.0f);
 static glm::mat4 gMV(1.0f);
 static glm::mat4 gMVP(1.0f);
@@ -101,11 +102,9 @@ static const float kZFar  = 1000000.0f;
 
 // ---------------- Utils ----------------
 static inline double clamp01(double x){ return x<0?0:(x>1?1:x); }
-
 static inline double triArea(const Vec3& a, const Vec3& b, const Vec3& c) {
   return 0.5 * ((b-a).cross(c-a)).norm();
 }
-
 static inline double cotan_at(const Vec3& a, const Vec3& b, const Vec3& c) {
   Vec3 u = b - a, v = c - a;
   double num = u.dot(v);
@@ -114,7 +113,7 @@ static inline double cotan_at(const Vec3& a, const Vec3& b, const Vec3& c) {
   return num / den;
 }
 
-// ---------------- OBJ loader (v + triangular f) ----------------
+// ---------------- OBJ loader ----------------
 bool loadOBJ(const std::string& path, Mesh& M) {
   std::ifstream in(path);
   if(!in) { std::fprintf(stderr,"[ERR] cannot open: %s\n", path.c_str()); return false; }
@@ -155,7 +154,7 @@ bool loadOBJ(const std::string& path, Mesh& M) {
   return true;
 }
 
-// ---------------- Discrete operators ----------------
+// ---------------- Operators ----------------
 void buildLaplacianAndMass(Mesh& M) {
   const int n = (int)M.V.size();
   std::vector<double> Avert(n,0.0);
@@ -224,12 +223,12 @@ Eigen::VectorXd solveHeat(const Mesh& M, int source) {
 static inline Vec3 faceGradient(const Vec3& vi, const Vec3& vj, const Vec3& vk,
                                 double ui, double uj, double uk) {
   Vec3 e0 = vj - vi;
-  Vec3 N = e0.cross(vk - vi); // not normalized
-  double Af2 = N.norm();      // 2*Area
+  Vec3 N = e0.cross(vk - vi);
+  double Af2 = N.norm();
   if(Af2 < 1e-20) return Vec3::Zero();
-  Vec3 e_i = vk - vj; // opposite to vertex i
-  Vec3 e_j = vi - vk; // opposite to vertex j
-  Vec3 e_k = vj - vi; // opposite to vertex k
+  Vec3 e_i = vk - vj;
+  Vec3 e_j = vi - vk;
+  Vec3 e_k = vj - vi;
   Vec3 nrm = N.normalized();
   Vec3 grad = (ui * (nrm.cross(e_i))
              + uj * (nrm.cross(e_j))
@@ -237,15 +236,14 @@ static inline Vec3 faceGradient(const Vec3& vi, const Vec3& vj, const Vec3& vk,
   return grad;
 }
 
-// ---- New: edge-averaged X with single accumulation per edge + zero-mean RHS ----
+// ---- Edge-averaged divergence + zero-mean RHS ----
 Eigen::VectorXd buildDivergenceRHS(const Mesh& M, const Eigen::VectorXd& u) {
   const int n = (int)M.V.size();
 
-  // 1) 面ごとの単位ベクトル場 X_f を計算
   struct EdgeAcc {
-    glm::vec3 Xsum = glm::vec3(0.0f);
-    double wsum = 0.0;   // 0.5*cot の和（両面を自然に合算）
-    double csum = 0.0;   // 何面から来たか（平均のため）
+    glm::vec3 Xsum = glm::vec3(0);
+    double wsum = 0.0;
+    double csum = 0.0;
   };
   auto mkp = [](int a,int b){ if(a>b) std::swap(a,b); return std::make_pair(a,b); };
   std::map<std::pair<int,int>, EdgeAcc> acc;
@@ -262,16 +260,15 @@ Eigen::VectorXd buildDivergenceRHS(const Mesh& M, const Eigen::VectorXd& u) {
       Xf = glm::vec3((float)X.x(), (float)X.y(), (float)X.z());
     }
 
-    // 各エッジに X を足し、重み 0.5*cot(opp) を足す
-    double cot_k = cotan_at(vk, vi, vj); // edge (i,j) の反対角
-    double cot_i = cotan_at(vi, vj, vk); // edge (j,k)
-    double cot_j = cotan_at(vj, vk, vi); // edge (k,i)
+    double cot_k = cotan_at(vk, vi, vj);
+    double cot_i = cotan_at(vi, vj, vk);
+    double cot_j = cotan_at(vj, vk, vi);
 
-    auto add_edge = [&](int a,int b,double half_cot){
+    auto add_edge = [&](int a,int b,double cot_opp){
       auto key = mkp(a,b);
       auto &E = acc[key];
       E.Xsum += Xf;
-      E.wsum += 0.5 * half_cot * 2.0; // half_cot は "cot(opp)"。ここで 0.5*cot を足す。
+      E.wsum += 0.5 * cot_opp;
       E.csum += 1.0;
     };
     add_edge(i,j,cot_k);
@@ -279,24 +276,23 @@ Eigen::VectorXd buildDivergenceRHS(const Mesh& M, const Eigen::VectorXd& u) {
     add_edge(k,i,cot_j);
   }
 
-  // 2) エッジごとに平均 X_edge と合算重み w を用いて一度だけ加算
   Eigen::VectorXd rhs = Eigen::VectorXd::Zero(n);
   for (const auto& kv : acc) {
     int p = kv.first.first;
     int q = kv.first.second;
     const EdgeAcc &E = kv.second;
     glm::vec3 Xavg = (E.csum > 0.0) ? (E.Xsum / (float)E.csum) : glm::vec3(0);
-    double w = 0.5 * E.wsum; // 上の足し方を 0.5*(cotα+cotβ) に合わせる
+    double w = E.wsum; // = 0.5*(cotα+cotβ)
     Vec3 e = M.V[q] - M.V[p];
     double flux = (double)Xavg.x * e.x() + (double)Xavg.y * e.y() + (double)Xavg.z * e.z();
     rhs[p] += w * flux;
     rhs[q] -= w * flux;
   }
 
-  // 3) ゼロ平均化（∑ b_i = 0）：面積重みで補正
+  // Zero-mean correction (area-weighted)
   double sumA = 0.0, sumB = 0.0;
-  for (size_t i=0;i<M.Avert.size();++i) { sumA += M.Avert[i]; }
-  for (int i=0;i<n;++i) { sumB += rhs[i]; }
+  for (double a : M.Avert) sumA += a;
+  for (int i=0;i<n;++i) sumB += rhs[i];
   if (std::abs(sumA) > 0) {
     double c = sumB / sumA;
     for (int i=0;i<n;++i) rhs[i] -= c * M.Avert[i];
@@ -305,7 +301,6 @@ Eigen::VectorXd buildDivergenceRHS(const Mesh& M, const Eigen::VectorXd& u) {
 }
 
 Eigen::VectorXd solvePoisson(const Mesh& M, const Eigen::VectorXd& b) {
-  // 正則化 Lc + eps*A
   Sparse Lreg = M.Lc + kEpsReg * M.A;
   gSolverPoisson.compute(Lreg);
   if(gSolverPoisson.info()!=Eigen::Success)
@@ -333,13 +328,12 @@ static void initCameraFromBounds() {
   sceneCenter = 0.5*(gM.bbmin + gM.bbmax);
   double diag = (gM.bbmax - gM.bbmin).norm();
   if (diag <= 1e-12) diag = 1.0;
-  camDist = diag * 1.8;   // distance proportional to bbox size
+  camDist = diag * 1.8;
   yawRad = 0.4; pitchRad = 0.2;
   panX = panY = 0.0;
 }
 
 static void setProjectionAndView() {
-  // OpenGL fixed-pipeline for drawing
   glMatrixMode(GL_PROJECTION);
   glLoadIdentity();
   double aspect = (double)gWinW / (double)gWinH;
@@ -347,7 +341,6 @@ static void setProjectionAndView() {
   glMatrixMode(GL_MODELVIEW);
   glLoadIdentity();
 
-  // glm matrices (for math & picking)
   gProj = glm::perspective(kFovY, (float)aspect, kZNear, kZFar);
   glm::mat4 R = glm::yawPitchRoll((float)yawRad, (float)pitchRad, 0.0f);
   glm::vec3 sc((float)sceneCenter.x(), (float)sceneCenter.y(), (float)sceneCenter.z());
@@ -356,37 +349,23 @@ static void setProjectionAndView() {
   glm::mat4 Tpan = glm::translate(glm::mat4(1.0f), glm::vec3((float)panX, (float)panY, 0.0f));
   gMV  = V * Tpan;
   gMVP = gProj * gMV;
-
-  // Load MV into OpenGL
   glLoadMatrixf(&gMV[0][0]);
 }
 
 // ---------------- Coloring ----------------
-// Red -> Yellow -> White heat colormap (distance small = white-ish, large = deep red)
 static void scalarToHeatColor(double s, double smin, double smax, double& r, double& g, double& b) {
   double t = (s - smin) / (smax - smin + 1e-20);
   t = clamp01(t);
-  if (t <= 0.5) {
-    double u = t / 0.5;      // 0..1
-    r = 1.0;
-    g = 0.1 + 0.9*u;         // 0.1 -> 1.0
-    b = 0.0;
-  } else {
-    double u = (t - 0.5) / 0.5; // 0..1
-    r = 1.0;
-    g = 1.0;
-    b = 0.0 + 1.0*u;         // yellow -> white
-  }
+  if (t <= 0.5) { double u = t / 0.5; r = 1.0; g = 0.1 + 0.9*u; b = 0.0; }
+  else { double u = (t - 0.5) / 0.5; r = 1.0; g = 1.0; b = 0.0 + 1.0*u; }
 }
 
 // ---------------- Rendering ----------------
 static int gSource = -1;
 
-// 1) color pass
 static void renderSurfaceColored() {
   if(gM.V.empty() || gM.F.empty() || gM.phi.empty()) return;
 
-  // p98 clipping to avoid white-out while keeping highlights
   std::vector<double> tmp = gM.phi;
   std::nth_element(tmp.begin(), tmp.begin() + (int)(0.98*tmp.size()), tmp.end());
   double p98 = tmp[(int)(0.98*tmp.size())];
@@ -405,7 +384,6 @@ static void renderSurfaceColored() {
   }
   glEnd();
 
-  // mark source vertex
   if(gSource>=0){
     glPointSize(6.f);
     glBegin(GL_POINTS);
@@ -416,13 +394,10 @@ static void renderSurfaceColored() {
   }
 }
 
-// 2) contour pass (white isolines): triangle-by-triangle edge intersection
 static void renderContours() {
   if(gM.V.empty() || gM.F.empty() || gM.phi.empty()) return;
 
-  // contour spacing from actual distance range (≈ 25–40 lines looks good)
-  double vmax = 0.0;
-  for (double v : gM.phi) vmax = std::max(vmax, v);
+  double vmax = 0.0; for (double v : gM.phi) vmax = std::max(vmax, v);
   int nLines = 32;
   const double step = std::max(1e-12, vmax / (double)nLines);
 
@@ -452,8 +427,7 @@ static void renderContours() {
       Vec3 P[2];
       int cnt = 0;
       auto edge_isect = [&](const Vec3& a, const Vec3& b, double pa, double pb){
-        double d0 = pa - iso;
-        double d1 = pb - iso;
+        double d0 = pa - iso, d1 = pb - iso;
         if ((d0>0 && d1>0) || (d0<0 && d1<0)) return;
         if (std::abs(d0) < 1e-15 && std::abs(d1) < 1e-15) return;
         double denom = (pb - pa);
@@ -476,10 +450,7 @@ static void renderContours() {
   glEnd();
 }
 
-static void renderScene() {
-  renderSurfaceColored();
-  renderContours();
-}
+static void renderScene() { renderSurfaceColored(); renderContours(); }
 
 // ---------------- Picking ----------------
 static int pickNearestVertex(int mouseX, int mouseY) {
@@ -494,7 +465,7 @@ static int pickNearestVertex(int mouseX, int mouseY) {
     const Vec3& v = gM.V[i];
     glm::vec4 clip = gMVP * glm::vec4((float)v.x(), (float)v.y(), (float)v.z(), 1.0f);
     if (clip.w == 0.0f) continue;
-    glm::vec3 ndc = glm::vec3(clip) / clip.w; // [-1,1]
+    glm::vec3 ndc = glm::vec3(clip) / clip.w;
     if (ndc.z < -1.0f || ndc.z > 1.0f) continue;
     float sx = (ndc.x * 0.5f + 0.5f) * (float)gWinW;
     float sy = (ndc.y * 0.5f + 0.5f) * (float)gWinH;
@@ -518,12 +489,7 @@ static void displayCB() {
 
   glutSwapBuffers();
 }
-
-static void reshapeCB(int w, int h) {
-  gWinW = (w>1)?w:1;
-  gWinH = (h>1)?h:1;
-  glutPostRedisplay();
-}
+static void reshapeCB(int w, int h) { gWinW = (w>1)?w:1; gWinH = (h>1)?h:1; glutPostRedisplay(); }
 
 static void keyboardCB(unsigned char key, int, int) {
   if(key==27 || key=='q') std::exit(0);
@@ -541,32 +507,24 @@ static void keyboardCB(unsigned char key, int, int) {
 
 static void mouseButtonCB(int button,int state,int x,int y){
   if (button == GLUT_LEFT_BUTTON)  {
-    if (state == GLUT_DOWN) {
-      lbtn = true; moved = false; downX = lastX = x; downY = lastY = y;
-    } else {
+    if (state == GLUT_DOWN) { lbtn = true; moved = false; downX = lastX = x; downY = lastY = y; }
+    else {
       lbtn = false;
       int dx = x - downX, dy = y - downY;
       if (std::abs(dx) <= CLICK_MOVE_TOL && std::abs(dy) <= CLICK_MOVE_TOL) {
         int vid = pickNearestVertex(x,y);
-        if (vid >= 0) {
-          gSource = vid;
-          computeDistance(gM, gSource);
-        }
+        if (vid >= 0) { gSource = vid; computeDistance(gM, gSource); }
       }
     }
   }
-  if (button == GLUT_RIGHT_BUTTON) {
-    if (state == GLUT_DOWN) { rbtn = true; lastX = x; lastY = y; }
-    else rbtn = false;
-  }
+  if (button == GLUT_RIGHT_BUTTON) { rbtn = (state==GLUT_DOWN); lastX = x; lastY = y; }
 }
 
 static void mouseMotionCB(int x,int y){
-  int dx = x - lastX;
-  int dy = y - lastY;
+  int dx = x - lastX, dy = y - lastY;
   lastX = x; lastY = y;
 
-  if (lbtn) { // rotate
+  if (lbtn) {
     if (std::abs(x - downX) > CLICK_MOVE_TOL || std::abs(y - downY) > CLICK_MOVE_TOL) moved = true;
     yawRad   += dx * 0.005;
     pitchRad += dy * 0.005;
@@ -574,7 +532,7 @@ static void mouseMotionCB(int x,int y){
     if (pitchRad >  lim) pitchRad =  lim;
     if (pitchRad < -lim) pitchRad = -lim;
   }
-  if (rbtn) { // pan
+  if (rbtn) {
     double s = 0.002 * camDist;
     panX += dx * s;
     panY -= dy * s;
@@ -591,17 +549,37 @@ static void mouseWheelCB(int wheel, int direction, int x, int y){
 }
 #endif
 
+// ---------------- usage() ----------------
+static void usage(const char* argv0){
+  std::puts("=== Geodesics in Heat Viewer ===");
+  std::printf("Usage: %s mesh.obj\n", argv0);
+  std::puts("\nMouse:");
+  std::puts("  Left-drag   : rotate camera (yaw/pitch)");
+  std::puts("  Right-drag  : pan");
+#if defined(FREEGLUT)
+  std::puts("  Wheel       : zoom");
+#endif
+  std::puts("\nKeyboard:");
+  std::puts("  r           : pick random source vertex & recompute");
+  std::puts("  [ / ]       : decrease / increase heat-time scale eta");
+  std::puts("  + / -       : zoom in / out");
+  std::puts("  q / ESC     : quit");
+  std::puts("\nTips:");
+  std::puts("  - Left-click without dragging to set the source vertex (recompute).");
+  std::puts("  - eta controls diffusion time t=(eta*h)^2; try 1.5~3.0 for most meshes.");
+  std::puts("");
+}
+
 // ---------------- Main ----------------
 int main(int argc, char** argv) {
   if(argc < 2) {
-    std::fprintf(stderr,"Usage: %s mesh.obj\n", argv[0]);
+    usage(argv[0]);
     return 1;
   }
   if(!loadOBJ(argv[1], gM)) return 1;
 
   buildLaplacianAndMass(gM);
 
-  // initial source & distance
   std::uniform_int_distribution<int> dist(0, (int)gM.V.size()-1);
   gSource = dist(gRng);
   computeDistance(gM, gSource);
@@ -616,13 +594,15 @@ int main(int argc, char** argv) {
   glutInitWindowSize(gWinW, gWinH);
   glutCreateWindow("Heat Geodesic (Eigen + glm + GLUT) - edge-avg divergence");
 
+  usage(argv[0]);
+
   glutDisplayFunc(displayCB);
   glutReshapeFunc(reshapeCB);
   glutKeyboardFunc(keyboardCB);
   glutMouseFunc(mouseButtonCB);
   glutMotionFunc(mouseMotionCB);
 #if defined(FREEGLUT)
-  glutMouseWheelFunc(mouseWheelCB); // wheel only with freeglut
+  glutMouseWheelFunc(mouseWheelCB);
 #endif
 
   glEnable(GL_POLYGON_OFFSET_FILL);
