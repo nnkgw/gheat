@@ -1,42 +1,38 @@
 // gheat.cpp
-// Heat Method (Geodesics in Heat) minimal viewer with mouse camera controls.
-// Dependencies: C++17, Eigen (Core/Sparse/Geometry), OpenGL + GLUT/freeglut.
-//
-// Controls:
-//   Mouse Left-drag  : rotate (yaw/pitch)
-//   Mouse Right-drag : pan
-//   Mouse Wheel      : zoom  (only when FREEGLUT is defined)
-//   + / -            : zoom in / out
-//   r                : re-pick random source vertex and recompute
-//   q / ESC          : quit
-//
-// Build (Linux):
-//   g++ gheat.cpp -std=gnu++17 -O2 -I/path/to/eigen -lglut -lGL -lGLU
-// Build (macOS):
-//   g++ gheat.cpp -std=gnu++17 -O2 -I/path/to/eigen -framework OpenGL -framework GLUT
-// Build (Windows MinGW/MSYS2):
-//   g++ gheat.cpp -std=gnu++17 -O2 -I/path/to/eigen -lfreeglut -lopengl32 -lglu32
-//
-// Note: If you include <GL/freeglut.h>, FREEGLUT macro is defined and wheel zoom is enabled.
-//       If you include platform GLUT (<GLUT/glut.h> on macOS), wheel zoom is disabled by #if.
+// Heat Method (Geodesics in Heat) viewer with glm-based camera & vertex picking.
+// Compute: Eigen (sparse). Rendering & camera: OpenGL + GLUT/freeglut + glm.
+// Mouse:
+//   - Left-drag : rotate (yaw/pitch)
+//   - Right-drag: pan
+//   - Left-click (no drag): pick nearest projected vertex -> recompute distances
+//   - Mouse wheel: zoom (ONLY when FREEGLUT is defined)
+// Keys:
+//   - r : randomize source vertex
+//   - +/- : zoom in/out
+//   - q or ESC : quit
 
 #if defined(WIN32)
   #pragma warning(disable:4996)
-  #include <GL/freeglut.h>
-  #define HAVE_FREEGLUT 1
+  #include <GL/freeglut.h>   // defines FREEGLUT
 #elif defined(__APPLE__) || defined(MACOSX)
   #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   #define GL_SILENCE_DEPRECATION
   #include <GLUT/glut.h>
 #else
-  #include <GL/freeglut.h>
-  #define HAVE_FREEGLUT 1
+  #include <GL/freeglut.h>   // defines FREEGLUT
 #endif
+
+#define GLM_FORCE_RADIANS
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/euler_angles.hpp> // yawPitchRoll
 
 #include <Eigen/Core>
 #include <Eigen/SparseCore>
 #include <Eigen/SparseCholesky>
-#include <Eigen/Geometry> // for Vector3d::cross(), normalized()
+#include <Eigen/Geometry> // Vector3d::cross, normalized
+
 #include <cstdio>
 #include <cstdlib>
 #include <cfloat>
@@ -48,17 +44,17 @@
 #include <random>
 #include <algorithm>
 
-// ----------------------------- Types -----------------------------
+// ---------------- Types ----------------
 using Vec3 = Eigen::Vector3d;
 using Sparse = Eigen::SparseMatrix<double>;
 using Triplet = Eigen::Triplet<double>;
 
 struct Mesh {
-  std::vector<Vec3> V;                 // vertices
-  std::vector<Eigen::Vector3i> F;      // triangles (0-based)
-  std::vector<double> Avert;           // lumped vertex areas
-  std::vector<double> phi;             // distance field
-  std::vector<double> uheat;           // heat solution
+  std::vector<Vec3> V;
+  std::vector<Eigen::Vector3i> F;
+  std::vector<double> Avert;   // lumped mass per vertex
+  std::vector<double> phi;     // distance field
+  std::vector<double> uheat;   // heat solution
   Sparse Lc; // cotan stiffness
   Sparse A;  // lumped mass (diagonal)
   double meanEdge = 1.0;
@@ -71,19 +67,31 @@ static std::mt19937_64 gRng(12345);
 static Eigen::SimplicialLDLT<Sparse> gSolverHeat;
 static Eigen::SimplicialLDLT<Sparse> gSolverPoisson;
 
-// ----------------------------- Camera (mouse ) -----------------------------
-// (Left-drag: rotate yaw/pitch, Right-drag: pan, Wheel: zoom ONLY when FREEGLUT)
-// Initial camera distance is based on the .obj bounding box size.  :contentReference[oaicite:1]{index=1}
+// ---------------- Window/Camera ----------------
 static int gWinW = 1280, gWinH = 800;
 static double camDist = 3.0;     // distance from target
-static double yawRad = 0.4;      // yaw (around Y), radians
-static double pitchRad = 0.2;    // pitch (around X), radians
-static double panX = 0.0, panY = 0.0;  // pan in view plane
-static int lastX = -1, lastY = -1;
-static bool lbtn = false, rbtn = false;
+static double yawRad = 0.4;      // yaw around +Y
+static double pitchRad = 0.2;    // pitch around +X
+static double panX = 0.0, panY = 0.0; // pan in view plane
 static Vec3 sceneCenter(0,0,0);
 
-// ----------------------------- Helpers -----------------------------
+// for picking & drag detection
+static int lastX = -1, lastY = -1;
+static int downX = -1, downY = -1;
+static bool lbtn = false, rbtn = false;
+static bool moved = false;
+static const int PICK_RADIUS_PX = 12;   // max pixel distance for picking
+static const int CLICK_MOVE_TOL = 3;    // pixels: within -> treated as click
+
+// keep glm matrices in sync with OpenGL fixed pipeline
+static glm::mat4 gProj(1.0f);
+static glm::mat4 gMV(1.0f);
+static glm::mat4 gMVP(1.0f);
+static const float kFovY = glm::radians(45.0f);
+static const float kZNear = 0.001f;
+static const float kZFar  = 1000000.0f;
+
+// ---------------- Utils ----------------
 static inline double clamp01(double x){ return x<0?0:(x>1?1:x); }
 
 static inline double triArea(const Vec3& a, const Vec3& b, const Vec3& c) {
@@ -98,7 +106,7 @@ static inline double cotan_at(const Vec3& a, const Vec3& b, const Vec3& c) {
   return num / den;
 }
 
-// Simple OBJ loader: supports 'v' and triangular 'f' (also f with slashes)
+// ---------------- OBJ loader (v + triangular f) ----------------
 bool loadOBJ(const std::string& path, Mesh& M) {
   std::ifstream in(path);
   if(!in) { std::fprintf(stderr,"[ERR] cannot open: %s\n", path.c_str()); return false; }
@@ -139,6 +147,7 @@ bool loadOBJ(const std::string& path, Mesh& M) {
   return true;
 }
 
+// ---------------- Discrete operators ----------------
 void buildLaplacianAndMass(Mesh& M) {
   const int n = (int)M.V.size();
   std::vector<double> Avert(n,0.0);
@@ -184,9 +193,10 @@ void buildLaplacianAndMass(Mesh& M) {
   M.meanEdge = (elCount>0) ? (elSum / (double)elCount) : 1.0;
 }
 
+// ---------------- Heat Method ----------------
 Eigen::VectorXd solveHeat(const Mesh& M, int source) {
   const int n = (int)M.V.size();
-  double t = M.meanEdge * M.meanEdge;
+  double t = M.meanEdge * M.meanEdge;           // t ? h^2
   Sparse H = M.A - t * M.Lc;
 
   gSolverHeat.compute(H);
@@ -205,17 +215,16 @@ Eigen::VectorXd solveHeat(const Mesh& M, int source) {
 static inline Vec3 faceGradient(const Vec3& vi, const Vec3& vj, const Vec3& vk,
                                 double ui, double uj, double uk) {
   Vec3 e0 = vj - vi;
-  Vec3 N = e0.cross(vk - vi); // not normalized yet
-  double Af2 = N.norm();      // = 2*Area
+  Vec3 N = e0.cross(vk - vi); // not normalized
+  double Af2 = N.norm();      // 2*Area
   if(Af2 < 1e-20) return Vec3::Zero();
   Vec3 e_i = vk - vj; // opposite to vertex i
   Vec3 e_j = vi - vk; // opposite to vertex j
   Vec3 e_k = vj - vi; // opposite to vertex k
-  Vec3 grad = (ui * (N.normalized().cross(e_i))
-             + uj * (N.normalized().cross(e_j))
-             + uk * (N.normalized().cross(e_k))) / (Af2);
-  // (Af2 = 2A, denominator should be 2A; we used N.normalized()/ (2A) == N/(2A*|N|)
-  // To keep consistent with earlier minimal code, this is sufficient visually.
+  Vec3 nrm = N.normalized();
+  Vec3 grad = (ui * (nrm.cross(e_i))
+             + uj * (nrm.cross(e_j))
+             + uk * (nrm.cross(e_k))) / (Af2);
   return grad;
 }
 
@@ -271,42 +280,41 @@ void computeDistance(Mesh& M, int source) {
   M.phi.assign(phi.data(), phi.data()+phi.size());
 }
 
-// ----------------------------- Camera utils -----------------------------
+// ---------------- Camera ----------------
 static void initCameraFromBounds() {
   sceneCenter = 0.5*(gM.bbmin + gM.bbmax);
   double diag = (gM.bbmax - gM.bbmin).norm();
   if (diag <= 1e-12) diag = 1.0;
-  camDist = diag * 1.8;     // like the sample: distance proportional to bbox size  :contentReference[oaicite:2]{index=2}
+  camDist = diag * 1.8;
   yawRad = 0.4; pitchRad = 0.2;
   panX = panY = 0.0;
 }
 
 static void setProjectionAndView() {
+  // OpenGL fixed-pipeline (for drawing)
   glMatrixMode(GL_PROJECTION);
   glLoadIdentity();
   double aspect = (double)gWinW / (double)gWinH;
-  gluPerspective(45.0, aspect, 0.001, 1e6);
-
+  gluPerspective(45.0, aspect, kZNear, kZFar);
   glMatrixMode(GL_MODELVIEW);
   glLoadIdentity();
 
-  // ModelView = T_camera * R_yaw * R_pitch * T_pan * T_center
-  // (We build with fixed-pipeline matrix ops for simplicity)
-  // Move back by camDist
-  glTranslated(0, 0, -camDist);
+  // glm matrices (for math & picking)
+  gProj = glm::perspective(kFovY, (float)aspect, kZNear, kZFar);
 
-  // Rotate by yaw (Y), then pitch (X)
-  glRotated(yawRad * 180.0 / M_PI, 0, 1, 0);
-  glRotated(pitchRad * 180.0 / M_PI, 1, 0, 0);
+  glm::mat4 R = glm::yawPitchRoll((float)yawRad, (float)pitchRad, 0.0f);
+  glm::vec3 sc((float)sceneCenter.x(), (float)sceneCenter.y(), (float)sceneCenter.z());
+  glm::vec3 eye = sc + glm::vec3(R * glm::vec4(0, 0, (float)camDist, 1));
+  glm::mat4 V = glm::lookAt(eye, sc, glm::vec3(0,1,0));
+  glm::mat4 Tpan = glm::translate(glm::mat4(1.0f), glm::vec3((float)panX, (float)panY, 0.0f));
+  gMV = V * Tpan;
+  gMVP = gProj * gMV;
 
-  // Pan (in view plane). Scale pan speed implicitly by camDist in handlers.
-  glTranslated(panX, panY, 0);
-
-  // Center the scene
-  glTranslated(-sceneCenter.x(), -sceneCenter.y(), -sceneCenter.z());
+  // Load MV into OpenGL
+  glLoadMatrixf(&gMV[0][0]);
 }
 
-// ----------------------------- Color mapping -----------------------------
+// ---------------- Coloring ----------------
 static void scalarToRGB(double s, double smin, double smax, double& r, double& g, double& b) {
   double t = (s - smin) / (smax - smin + 1e-20);
   t = clamp01(t);
@@ -316,7 +324,7 @@ static void scalarToRGB(double s, double smin, double smax, double& r, double& g
   b = clamp01(0.9 -  1.2*x + 0.3*std::sin(6.28318*x));
 }
 
-// ----------------------------- Rendering -----------------------------
+// ---------------- Rendering ----------------
 static int gSource = -1;
 
 static void renderMeshColored() {
@@ -350,7 +358,38 @@ static void renderMeshColored() {
   }
 }
 
-// ----------------------------- GLUT callbacks -----------------------------
+// ---------------- Picking ----------------
+// Screen (x,y) in window coords -> pick nearest projected vertex within radius.
+static int pickNearestVertex(int mouseX, int mouseY) {
+  if(gM.V.empty()) return -1;
+  // flip Y to OpenGL window coords
+  int winX = mouseX;
+  int winY = gWinH - mouseY - 1;
+
+  int best = -1;
+  double bestD2 = (double)PICK_RADIUS_PX * (double)PICK_RADIUS_PX;
+
+  // Project each vertex via MVP (glm)
+  for (int i=0;i<(int)gM.V.size();++i) {
+    const Vec3& v = gM.V[i];
+    glm::vec4 clip = gMVP * glm::vec4((float)v.x(), (float)v.y(), (float)v.z(), 1.0f);
+    if (clip.w == 0.0f) continue;
+    glm::vec3 ndc = glm::vec3(clip) / clip.w; // [-1,1]
+    // Cull if behind near/far (optional)
+    if (ndc.z < -1.0f || ndc.z > 1.0f) continue;
+
+    // NDC -> window
+    float sx = (ndc.x * 0.5f + 0.5f) * (float)gWinW;
+    float sy = (ndc.y * 0.5f + 0.5f) * (float)gWinH;
+    double dx = (double)sx - (double)winX;
+    double dy = (double)sy - (double)winY;
+    double d2 = dx*dx + dy*dy;
+    if (d2 < bestD2) { bestD2 = d2; best = i; }
+  }
+  return best;
+}
+
+// ---------------- GLUT callbacks ----------------
 static void displayCB() {
   glViewport(0,0,gWinW,gWinH);
   glClearColor(0.08f,0.08f,0.1f,1.f);
@@ -382,9 +421,26 @@ static void keyboardCB(unsigned char key, int, int) {
 }
 
 static void mouseButtonCB(int button,int state,int x,int y){
-  if (button == GLUT_LEFT_BUTTON)  lbtn = (state == GLUT_DOWN);
-  if (button == GLUT_RIGHT_BUTTON) rbtn = (state == GLUT_DOWN);
-  lastX = x; lastY = y;
+  if (button == GLUT_LEFT_BUTTON)  {
+    if (state == GLUT_DOWN) {
+      lbtn = true; moved = false; downX = lastX = x; downY = lastY = y;
+    } else {
+      // release: if not moved -> treat as click -> pick
+      lbtn = false;
+      int dx = x - downX, dy = y - downY;
+      if (std::abs(dx) <= CLICK_MOVE_TOL && std::abs(dy) <= CLICK_MOVE_TOL) {
+        int vid = pickNearestVertex(x,y);
+        if (vid >= 0) {
+          gSource = vid;
+          computeDistance(gM, gSource);
+        }
+      }
+    }
+  }
+  if (button == GLUT_RIGHT_BUTTON) {
+    if (state == GLUT_DOWN) { rbtn = true; lastX = x; lastY = y; }
+    else rbtn = false;
+  }
 }
 
 static void mouseMotionCB(int x,int y){
@@ -393,13 +449,14 @@ static void mouseMotionCB(int x,int y){
   lastX = x; lastY = y;
 
   if (lbtn) { // rotate
+    if (std::abs(x - downX) > CLICK_MOVE_TOL || std::abs(y - downY) > CLICK_MOVE_TOL) moved = true;
     yawRad   += dx * 0.005;
     pitchRad += dy * 0.005;
     const double lim = 1.55;
     if (pitchRad >  lim) pitchRad =  lim;
     if (pitchRad < -lim) pitchRad = -lim;
   }
-  if (rbtn) { // pan (scale by distance)
+  if (rbtn) { // pan
     double s = 0.002 * camDist;
     panX += dx * s;
     panY -= dy * s;
@@ -407,7 +464,7 @@ static void mouseMotionCB(int x,int y){
   glutPostRedisplay();
 }
 
-#if defined(HAVE_FREEGLUT)
+#if defined(FREEGLUT)
 static void mouseWheelCB(int wheel, int direction, int x, int y){
   (void)wheel; (void)x; (void)y;
   camDist *= (direction > 0) ? 0.9 : 1.1;
@@ -416,7 +473,7 @@ static void mouseWheelCB(int wheel, int direction, int x, int y){
 }
 #endif
 
-// ----------------------------- Main -----------------------------
+// ---------------- Main ----------------
 int main(int argc, char** argv) {
   if(argc < 2) {
     std::fprintf(stderr,"Usage: %s mesh.obj\n", argv[0]);
@@ -431,24 +488,23 @@ int main(int argc, char** argv) {
   gSource = dist(gRng);
   computeDistance(gM, gSource);
 
-  // init camera from bounds (like the attached geodesic.cpp)  :contentReference[oaicite:3]{index=3}
   initCameraFromBounds();
 
   glutInit(&argc, argv);
-#if defined(HAVE_FREEGLUT)
+#if defined(FREEGLUT)
   glutSetOption(GLUT_ACTION_ON_WINDOW_CLOSE, GLUT_ACTION_GLUTMAINLOOP_RETURNS);
 #endif
   glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH);
   glutInitWindowSize(gWinW, gWinH);
-  glutCreateWindow("Heat Geodesic (Eigen + GLUT) - mouse camera");
+  glutCreateWindow("Heat Geodesic (Eigen + glm + GLUT) - mouse & picking");
 
   glutDisplayFunc(displayCB);
   glutReshapeFunc(reshapeCB);
   glutKeyboardFunc(keyboardCB);
   glutMouseFunc(mouseButtonCB);
   glutMotionFunc(mouseMotionCB);
-#if defined(HAVE_FREEGLUT)
-  glutMouseWheelFunc(mouseWheelCB); // enabled only when freeglut is available
+#if defined(FREEGLUT)
+  glutMouseWheelFunc(mouseWheelCB); // wheel only with freeglut
 #endif
 
   glEnable(GL_POLYGON_OFFSET_FILL);
