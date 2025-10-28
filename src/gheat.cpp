@@ -1,7 +1,6 @@
-// gheat.cpp
+﻿// gheat.cpp
 // Heat Method (Geodesics in Heat) viewer with glm-based camera, vertex picking,
 // red->yellow->white heat colormap, and white geodesic contour lines.
-// Compute: Eigen (sparse). Rendering & camera: OpenGL + GLUT/freeglut + glm.
 //
 // Mouse:
 //   Left-drag  : rotate (yaw/pitch)
@@ -11,6 +10,7 @@
 // Keys:
 //   r          : randomize source vertex
 //   +/-        : zoom in/out
+//   [ / ]      : heat-time scale eta -/+
 //   q / ESC    : quit
 
 #if defined(WIN32)
@@ -46,6 +46,7 @@
 #include <random>
 #include <algorithm>
 #include <limits>
+#include <map>
 
 // ---------------- Types ----------------
 using Vec3 = Eigen::Vector3d;
@@ -69,6 +70,10 @@ static Mesh gM;
 static std::mt19937_64 gRng(12345);
 static Eigen::SimplicialLDLT<Sparse> gSolverHeat;
 static Eigen::SimplicialLDLT<Sparse> gSolverPoisson;
+
+// Heat 時間スケール eta（t = (eta * meanEdge)^2）
+static double gEta = 2.0;
+static const double kEpsReg = 1e-8; // Poisson 正則化
 
 // ---------------- Window/Camera ----------------
 static int gWinW = 1280, gWinH = 800;
@@ -199,7 +204,8 @@ void buildLaplacianAndMass(Mesh& M) {
 // ---------------- Heat Method ----------------
 Eigen::VectorXd solveHeat(const Mesh& M, int source) {
   const int n = (int)M.V.size();
-  double t = M.meanEdge * M.meanEdge;           // t ? h^2
+  double h = M.meanEdge;
+  double t = (gEta * h) * (gEta * h);           // t = (eta*h)^2
   Sparse H = M.A - t * M.Lc;
 
   gSolverHeat.compute(H);
@@ -231,38 +237,77 @@ static inline Vec3 faceGradient(const Vec3& vi, const Vec3& vj, const Vec3& vk,
   return grad;
 }
 
+// ---- New: edge-averaged X with single accumulation per edge + zero-mean RHS ----
 Eigen::VectorXd buildDivergenceRHS(const Mesh& M, const Eigen::VectorXd& u) {
   const int n = (int)M.V.size();
-  Eigen::VectorXd b = Eigen::VectorXd::Zero(n);
 
-  for(const auto& f : M.F) {
+  // 1) 面ごとの単位ベクトル場 X_f を計算
+  struct EdgeAcc {
+    glm::vec3 Xsum = glm::vec3(0.0f);
+    double wsum = 0.0;   // 0.5*cot の和（両面を自然に合算）
+    double csum = 0.0;   // 何面から来たか（平均のため）
+  };
+  auto mkp = [](int a,int b){ if(a>b) std::swap(a,b); return std::make_pair(a,b); };
+  std::map<std::pair<int,int>, EdgeAcc> acc;
+
+  for (const auto& f : M.F) {
     int i=f[0], j=f[1], k=f[2];
     const Vec3 &vi=M.V[i], &vj=M.V[j], &vk=M.V[k];
-    double ui=u[i], uj=u[j], uk=u[k];
 
-    Vec3 gu = faceGradient(vi,vj,vk, ui,uj,uk);
-    double gu_norm = gu.norm();
-    if(gu_norm < 1e-20) continue;
-    Vec3 X = -gu / gu_norm;
+    Vec3 gu = faceGradient(vi, vj, vk, u[i], u[j], u[k]);
+    double ng = gu.norm();
+    glm::vec3 Xf(0.0f);
+    if (ng >= 1e-20) {
+      Vec3 X = -gu / ng;
+      Xf = glm::vec3((float)X.x(), (float)X.y(), (float)X.z());
+    }
 
-    double coti = cotan_at(vi, vj, vk);
-    double cotj = cotan_at(vj, vk, vi);
-    double cotk = cotan_at(vk, vi, vj);
+    // 各エッジに X を足し、重み 0.5*cot(opp) を足す
+    double cot_k = cotan_at(vk, vi, vj); // edge (i,j) の反対角
+    double cot_i = cotan_at(vi, vj, vk); // edge (j,k)
+    double cot_j = cotan_at(vj, vk, vi); // edge (k,i)
 
-    Vec3 e1 = vj - vi; Vec3 e2 = vk - vi;
-    double div_i = 0.5 * ( cotk * e1.dot(X) + cotj * e2.dot(X) );
-    Vec3 e1j = vk - vj; Vec3 e2j = vi - vj;
-    double div_j = 0.5 * ( coti * e1j.dot(X) + cotk * e2j.dot(X) );
-    Vec3 e1k = vi - vk; Vec3 e2k = vj - vk;
-    double div_k = 0.5 * ( cotj * e1k.dot(X) + coti * e2k.dot(X) );
-
-    b[i] += div_i; b[j] += div_j; b[k] += div_k;
+    auto add_edge = [&](int a,int b,double half_cot){
+      auto key = mkp(a,b);
+      auto &E = acc[key];
+      E.Xsum += Xf;
+      E.wsum += 0.5 * half_cot * 2.0; // half_cot は "cot(opp)"。ここで 0.5*cot を足す。
+      E.csum += 1.0;
+    };
+    add_edge(i,j,cot_k);
+    add_edge(j,k,cot_i);
+    add_edge(k,i,cot_j);
   }
-  return b;
+
+  // 2) エッジごとに平均 X_edge と合算重み w を用いて一度だけ加算
+  Eigen::VectorXd rhs = Eigen::VectorXd::Zero(n);
+  for (const auto& kv : acc) {
+    int p = kv.first.first;
+    int q = kv.first.second;
+    const EdgeAcc &E = kv.second;
+    glm::vec3 Xavg = (E.csum > 0.0) ? (E.Xsum / (float)E.csum) : glm::vec3(0);
+    double w = 0.5 * E.wsum; // 上の足し方を 0.5*(cotα+cotβ) に合わせる
+    Vec3 e = M.V[q] - M.V[p];
+    double flux = (double)Xavg.x * e.x() + (double)Xavg.y * e.y() + (double)Xavg.z * e.z();
+    rhs[p] += w * flux;
+    rhs[q] -= w * flux;
+  }
+
+  // 3) ゼロ平均化（∑ b_i = 0）：面積重みで補正
+  double sumA = 0.0, sumB = 0.0;
+  for (size_t i=0;i<M.Avert.size();++i) { sumA += M.Avert[i]; }
+  for (int i=0;i<n;++i) { sumB += rhs[i]; }
+  if (std::abs(sumA) > 0) {
+    double c = sumB / sumA;
+    for (int i=0;i<n;++i) rhs[i] -= c * M.Avert[i];
+  }
+  return rhs;
 }
 
 Eigen::VectorXd solvePoisson(const Mesh& M, const Eigen::VectorXd& b) {
-  gSolverPoisson.compute(M.Lc);
+  // 正則化 Lc + eps*A
+  Sparse Lreg = M.Lc + kEpsReg * M.A;
+  gSolverPoisson.compute(Lreg);
   if(gSolverPoisson.info()!=Eigen::Success)
     std::fprintf(stderr,"[ERR] Poisson factorization failed\n");
 
@@ -321,7 +366,6 @@ static void setProjectionAndView() {
 static void scalarToHeatColor(double s, double smin, double smax, double& r, double& g, double& b) {
   double t = (s - smin) / (smax - smin + 1e-20);
   t = clamp01(t);
-  // Piecewise: [0,0.5]: red->yellow, (0.5,1]: yellow->white
   if (t <= 0.5) {
     double u = t / 0.5;      // 0..1
     r = 1.0;
@@ -342,11 +386,11 @@ static int gSource = -1;
 static void renderSurfaceColored() {
   if(gM.V.empty() || gM.F.empty() || gM.phi.empty()) return;
 
-  // Contrast boost: clamp upper to 95th percentile
+  // p98 clipping to avoid white-out while keeping highlights
   std::vector<double> tmp = gM.phi;
-  std::nth_element(tmp.begin(), tmp.begin() + (int)(0.95*tmp.size()), tmp.end());
-  double p95 = tmp[(int)(0.95*tmp.size())];
-  double smin = 0.0, smax = std::max(1e-9, p95);
+  std::nth_element(tmp.begin(), tmp.begin() + (int)(0.98*tmp.size()), tmp.end());
+  double p98 = tmp[(int)(0.98*tmp.size())];
+  double smin = 0.0, smax = std::max(1e-9, p98);
 
   glBegin(GL_TRIANGLES);
   for(const auto& f : gM.F) {
@@ -376,13 +420,16 @@ static void renderSurfaceColored() {
 static void renderContours() {
   if(gM.V.empty() || gM.F.empty() || gM.phi.empty()) return;
 
-  // Choose contour spacing relative to mean edge length
-  const double step = std::max(1e-12, 0.5 * gM.meanEdge); // tune factor (0.3~1.0*meanEdge)
+  // contour spacing from actual distance range (≈ 25–40 lines looks good)
+  double vmax = 0.0;
+  for (double v : gM.phi) vmax = std::max(vmax, v);
+  int nLines = 32;
+  const double step = std::max(1e-12, vmax / (double)nLines);
+
   glDisable(GL_LIGHTING);
   glLineWidth(1.25f);
   glColor3d(1,1,1);
 
-  // Helper lambda: returns intersection point on edge (a->b) at iso value s
   auto lerpPoint = [](const Vec3& a, const Vec3& b, double ta)->Vec3 {
     return a + ta * (b - a);
   };
@@ -397,20 +444,18 @@ static void renderContours() {
     double tmax = std::max({pi,pj,pk});
     if (tmax - tmin < 1e-12) continue;
 
-    // integer k s.t. iso = k*step intersects [tmin, tmax]
     int kmin = (int)std::ceil( (tmin) / step );
     int kmax = (int)std::floor((tmax) / step);
     for (int kk = kmin; kk <= kmax; ++kk) {
       double iso = kk * step;
 
-      // intersect with triangle edges; collect up to 2 points
       Vec3 P[2];
       int cnt = 0;
       auto edge_isect = [&](const Vec3& a, const Vec3& b, double pa, double pb){
         double d0 = pa - iso;
         double d1 = pb - iso;
-        if ((d0>0 && d1>0) || (d0<0 && d1<0)) return; // no crossing
-        if (std::abs(d0) < 1e-15 && std::abs(d1) < 1e-15) return; // both exactly on iso: skip (rare)
+        if ((d0>0 && d1>0) || (d0<0 && d1<0)) return;
+        if (std::abs(d0) < 1e-15 && std::abs(d1) < 1e-15) return;
         double denom = (pb - pa);
         if (std::abs(denom) < 1e-15) return;
         double t = (iso - pa) / denom;
@@ -462,7 +507,7 @@ static int pickNearestVertex(int mouseX, int mouseY) {
 }
 
 // ---------------- GLUT callbacks ----------------
-static void display() {
+static void displayCB() {
   glViewport(0,0,gWinW,gWinH);
   glClearColor(0.08f,0.08f,0.1f,1.f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -474,13 +519,13 @@ static void display() {
   glutSwapBuffers();
 }
 
-static void reshape(int w, int h) {
+static void reshapeCB(int w, int h) {
   gWinW = (w>1)?w:1;
   gWinH = (h>1)?h:1;
   glutPostRedisplay();
 }
 
-static void keyboard(unsigned char key, int, int) {
+static void keyboardCB(unsigned char key, int, int) {
   if(key==27 || key=='q') std::exit(0);
   else if(key=='+') { camDist *= 0.9; if(camDist<1e-3) camDist=1e-3; }
   else if(key=='-') { camDist *= 1.1; }
@@ -489,10 +534,12 @@ static void keyboard(unsigned char key, int, int) {
     gSource = dist(gRng);
     computeDistance(gM, gSource);
   }
+  else if(key=='[') { gEta *= 0.8; if(gSource>=0) computeDistance(gM, gSource); std::fprintf(stderr,"eta=%.3f\n",gEta); }
+  else if(key==']') { gEta *= 1.25; if(gSource>=0) computeDistance(gM, gSource); std::fprintf(stderr,"eta=%.3f\n",gEta); }
   glutPostRedisplay();
 }
 
-static void mouse(int button,int state,int x,int y){
+static void mouseButtonCB(int button,int state,int x,int y){
   if (button == GLUT_LEFT_BUTTON)  {
     if (state == GLUT_DOWN) {
       lbtn = true; moved = false; downX = lastX = x; downY = lastY = y;
@@ -514,7 +561,7 @@ static void mouse(int button,int state,int x,int y){
   }
 }
 
-static void motion(int x,int y){
+static void mouseMotionCB(int x,int y){
   int dx = x - lastX;
   int dy = y - lastY;
   lastX = x; lastY = y;
@@ -536,7 +583,7 @@ static void motion(int x,int y){
 }
 
 #if defined(FREEGLUT)
-static void wheel(int wheel, int direction, int x, int y){
+static void mouseWheelCB(int wheel, int direction, int x, int y){
   (void)wheel; (void)x; (void)y;
   camDist *= (direction > 0) ? 0.9 : 1.1;
   if (camDist < 1e-3) camDist = 1e-3;
@@ -567,15 +614,15 @@ int main(int argc, char** argv) {
 #endif
   glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH);
   glutInitWindowSize(gWinW, gWinH);
-  glutCreateWindow("Geodesics in Heat: A New Approach to Computing Distance Based on Heat Flow");
+  glutCreateWindow("Heat Geodesic (Eigen + glm + GLUT) - edge-avg divergence");
 
-  glutDisplayFunc(display);
-  glutReshapeFunc(reshape);
-  glutKeyboardFunc(keyboard);
-  glutMouseFunc(mouse);
-  glutMotionFunc(motion);
+  glutDisplayFunc(displayCB);
+  glutReshapeFunc(reshapeCB);
+  glutKeyboardFunc(keyboardCB);
+  glutMouseFunc(mouseButtonCB);
+  glutMotionFunc(mouseMotionCB);
 #if defined(FREEGLUT)
-  glutMouseWheelFunc(wheel); // wheel only with freeglut
+  glutMouseWheelFunc(mouseWheelCB); // wheel only with freeglut
 #endif
 
   glEnable(GL_POLYGON_OFFSET_FILL);
